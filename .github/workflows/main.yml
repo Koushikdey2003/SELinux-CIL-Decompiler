@@ -32,40 +32,56 @@ jobs:
 
       - name: Collect SELinux Files & Decompile
         run: |
-          mkdir -p input_sepolicy
+          mkdir -p input_sepolicy/system/etc/selinux
+          mkdir -p input_sepolicy/vendor/etc/selinux
           mkdir -p output_te
           
-          echo "=== Поиск и сбор файлов SELinux из всех разделов ==="
+          echo "=== Подготовка идеального слепка (dump_root) для декомпилятора ==="
           
-          # Список стандартных мест и поиск по расширениям/именам (.cil, sepolicy, contexts)
-          # Ищем во всех ключевых директориях дампа (system, vendor, product, system_ext, odm)
-          find firmware_dump -type f \( -name "*.cil" -o -name "plat_sepolicy" -o -name "vendor_sepolicy" -o -name "precompiled_sepolicy" -o -name "*_contexts" \) | while read -r file; do
-            # Получаем относительный путь (например, system/etc/selinux/plat_sepolicy.cil)
-            rel_path=$(echo "$file" | sed 's|firmware_dump/||')
-            dir_name=$(dirname "$rel_path")
-            
-            # Воссоздаем структуру папок внутри input_sepolicy, чтобы скрипт понимал, откуда какой файл
-            mkdir -p "input_sepolicy/$dir_name"
-            cp "$file" "input_sepolicy/$dir_name/"
-            echo "Скопирован: $rel_path"
-          done
+          # 1. Собираем системные политики (сглаживаем проблему system/system/...)
+          find firmware_dump/system -type f -path "*/etc/selinux/*" -exec cp {} input_sepolicy/system/etc/selinux/ \;
+          
+          # 2. Собираем вендорские политики (теперь копируются ВСЕ файлы, включая .txt)
+          find firmware_dump/vendor -type f -path "*/etc/selinux/*" -exec cp {} input_sepolicy/vendor/etc/selinux/ \;
+          
+          # 3. Ищем build.prop (нужен декомпилятору для определения версии API)
+          BUILD_PROP=$(find firmware_dump/system -name "build.prop" | head -n 1)
+          if [ -n "$BUILD_PROP" ]; then
+            cp "$BUILD_PROP" input_sepolicy/system/build.prop
+            echo "Найден build.prop: $BUILD_PROP"
+          else
+            echo "build.prop не найден. Создаем фейковый для Android 11 (API 30)"
+            echo "ro.build.version.sdk=30" > input_sepolicy/system/build.prop
+          fi
 
-          # Проверяем, нашлось ли хоть что-то
-          if [ -z "$(ls -A input_sepolicy)" ]; then
-            echo "::error::Файлы SELinux не найдены в дампе! Проверьте структуру разделов."
+          # 4. Страховка от падений на assert (создаем текстовик версии, если его нет в дампе)
+          if [ ! -f "input_sepolicy/vendor/etc/selinux/plat_sepolicy_vers.txt" ]; then
+            echo "30.0" > input_sepolicy/vendor/etc/selinux/plat_sepolicy_vers.txt
+          fi
+
+          if [ ! -f "input_sepolicy/system/etc/selinux/plat_sepolicy.cil" ]; then
+            echo "::error::plat_sepolicy.cil не найден! Проверьте структуру дампа."
             exit 1
           fi
 
           echo "=== Запуск декомпилятора ==="
-          # Поиск самого скрипта decompile_cil.py в текущем репозитории экшена
           SCRIPT_PATH=$(find . -name "decompile_cil.py" | head -n 1)
           if [ -z "$SCRIPT_PATH" ]; then
-            echo "::error::Скрипт decompile_cil.py не найден в репозитории экшена!"
+            echo "::error::Скрипт decompile_cil.py не найден в репозитории!"
             exit 1
           fi
           
-          # Запуск декомпиляции из собранного со всех разделов слепка
-          python3 "$SCRIPT_PATH" -s input_sepolicy -o output_te
+          echo "=== Восстановление удаленного config.py ==="
+          cat << 'EOF' > "$(dirname "$SCRIPT_PATH")/sepolicy/config.py"
+          default_variables = {
+              'mls_num_sens': '1',
+              'mls_num_cats': '1024',
+          }
+          EOF
+          
+          # Передаем путь к конкретному разделу, чтобы скрипт правильно 
+          # вычислил dump_root. Декомпилируем вендорскую политику.
+          python3 "$SCRIPT_PATH" -s input_sepolicy/vendor/etc/selinux -o output_te
 
       - name: Upload Decompiled Policy Artifact
         uses: actions/upload-artifact@v4
